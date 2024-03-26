@@ -1,0 +1,169 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CalculateVertexByTiles
+#pragma kernel CalculateVertexForTileBasedMesh
+#pragma kernel CalculateVertexForMeshHeatMap
+#pragma kernel CalculateVertexForMeshHeatMap2
+
+#define THREAD_GROUP_SIZE_X 256
+#define THREAD_GROUP_SIZE_Y 1
+#define THREAD_GROUP_SIZE_Z 1
+
+cbuffer CB
+{
+    uint _VertexNum;
+    int _TileNumX;
+    float4 _TileParams2; // 分块数据（1.0 / width, 1.0 / height, 1.0 / tileNumX, 1.0 / tileNumY）
+    float4 _ScreenParams; // 屏幕分辨率数据 （width, height, 1.0 / width, 1.0 / height）
+    float4x4 _LocalToWorld;
+    float4x4 _UNITY_MATRIX_VP;
+    bool _UNITY_UV_STARTS_AT_TOP;
+}
+
+// input
+RWByteAddressBuffer _VertexData; // 所有需要渲染对象的顶点数据
+uint _VertexDataSize;
+// output
+RWStructuredBuffer<uint> _TileVerticesCount; // 长度为 tileNumX * tileNumY
+RWTexture2D<uint> _TileVerticesCountRT;
+
+float2 GetVertexScreenPos(float3 posOS, float4x4 localToWorld)
+{
+    float4 clipPos = mul(_UNITY_MATRIX_VP, mul(localToWorld, float4(posOS, 1.0)));
+    if(_UNITY_UV_STARTS_AT_TOP)
+        clipPos.y = -clipPos.y;
+    clipPos *= rcp(clipPos.w);
+    return clipPos.xy * 0.5 + 0.5;
+}
+
+// 计算顶点落在哪个分块区间上
+int GetVertexTileIndex(float3 posOS, float4x4 localToWorld)
+{
+    float2 uv = GetVertexScreenPos(posOS, localToWorld);
+    if(uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1)
+        return -1;
+    int2 ret;
+    ret.x = (uv.x * _ScreenParams.x * _TileParams2.x);
+    ret.y = (uv.y * _ScreenParams.y * _TileParams2.y);
+    return ret.y * _TileNumX + ret.x;
+}
+
+// 根据线程id，按位计算顶点坐标
+float3 ReadVertexPos(uint idx, uint dataSize, RWByteAddressBuffer vertexData)
+{
+    int vidx = idx * dataSize;
+    uint3 praw = vertexData.Load3(vidx << 2);
+    float3 p = asfloat(praw);
+    return p;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void CalculateVertexByTiles (uint3 id : SV_DispatchThreadID)
+{
+    uint vertexId = id.x;
+    if(vertexId < _VertexNum)
+    {
+        float3 vertexPos = ReadVertexPos(vertexId, _VertexDataSize, _VertexData);
+        int tileIndex = GetVertexTileIndex(vertexPos, _LocalToWorld);
+        if(tileIndex >= 0)
+            InterlockedAdd(_TileVerticesCount[tileIndex], 1);
+    }
+}
+
+// 统计Renderer在不同分区上的顶点数分布
+int _RendererId;
+int _TileCount;
+RWStructuredBuffer<uint> _VertexCounterBuffer; // 长度为 RendererNum * tileNumX * tileNumY
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void CalculateVertexForTileBasedMesh(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexId = id.x;
+    if(vertexId < _VertexNum)
+    {
+        float3 vertexPos = ReadVertexPos(vertexId, _VertexDataSize, _VertexData);
+        int tileIndex = GetVertexTileIndex(vertexPos, _LocalToWorld);
+        if(tileIndex >= 0)
+        {
+            int bufferId = _RendererId * _TileCount + tileIndex;
+            InterlockedAdd(_VertexCounterBuffer[bufferId], 1);
+        }
+    }
+}
+
+// 计算顶点落在哪个像素上
+int2 GetVertexPixelPos(float3 posOS, float4x4 localToWorld)
+{
+    float2 uv = GetVertexScreenPos(posOS, localToWorld);
+    if(uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1)
+        return int2(-1, -1);
+    int2 ret;
+    ret.x = uv.x * _ScreenParams.x;
+    ret.y = uv.y * _ScreenParams.y;
+    return ret;
+}
+
+// 将half4变回int
+int DecodeHalf4ToInt(half4 encodedValue)
+{
+    // 将half4中的值重新组合成int
+    int r = round(encodedValue.r * 255.0);
+    int g = round(encodedValue.g * 255.0);
+    int b = round(encodedValue.b * 255.0);
+    int a = round(encodedValue.a * 255.0);
+
+    // 组合成最终的int值
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+RWTexture2D<float2> _RenderIdAndDepthRT;
+RWTexture2D<uint> _TileProfilerRTUint;
+RWTexture2D<uint2> _TileProfilerRTUint2;
+int _UNITY_REVERSED_Z;
+int _CullMode; // 顶点显示剔除模式 0:None 1:Front 2:Back
+#define DepthPrecisionOffset 0.0001 // 深度精度补偿
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void CalculateVertexForMeshHeatMap(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexId = id.x;
+    if(vertexId < _VertexNum)
+    {
+        float3 vertexPos = ReadVertexPos(vertexId, _VertexDataSize, _VertexData);
+        int2 pixelIndex = GetVertexPixelPos(vertexPos, _LocalToWorld);
+        if(pixelIndex.x >= 0 && pixelIndex.y >= 0 && pixelIndex.x < _ScreenParams.x && pixelIndex.y < _ScreenParams.y)
+        {
+            float2 renderIdData = _RenderIdAndDepthRT[pixelIndex];
+            int pixelRendererId = renderIdData.x;
+            if(_CullMode == 0) // 不做背面剔除
+            {
+                if(pixelRendererId == _RendererId)
+                {
+                    InterlockedAdd(_TileProfilerRTUint[pixelIndex], 1u);
+                }
+            }
+            else
+            {
+                float4 clipPos = mul(_UNITY_MATRIX_VP, mul(_LocalToWorld, float4(vertexPos, 1.0)));
+                float depth = clipPos.z / clipPos.w + (_UNITY_REVERSED_Z == 1 ? DepthPrecisionOffset : -DepthPrecisionOffset);
+                bool depthPassed = _UNITY_REVERSED_Z == 1 ? depth >= renderIdData.y : depth <= renderIdData.y;
+                depthPassed = _CullMode == 2 ? depthPassed : !depthPassed;
+                if(pixelRendererId == _RendererId && depthPassed)
+                {
+                    InterlockedAdd(_TileProfilerRTUint[pixelIndex], 1u);
+                }
+            }
+        }
+    }
+}
+
+[numthreads(16, 16, 1)]
+void CalculateVertexForMeshHeatMap2(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = id.xy;
+    if(pos.x < _ScreenParams.x && pos.y < _ScreenParams.y)
+    {
+        float2 renderIdData = _RenderIdAndDepthRT[pos];
+        int pixelRendererId = renderIdData.x;
+        uint vertexCount = _TileProfilerRTUint[pos];
+        _TileProfilerRTUint2[pos] = uint2(pixelRendererId, vertexCount);
+    }
+}

@@ -1,0 +1,132 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GenerateProfilerRTForOnlyTile
+#pragma kernel GenerateProfilerRTForMeshHeatMap
+#pragma kernel GenerateProfilerRTForOverdraw
+
+#define THREAD_GROUP_SIZE_X 16
+#define THREAD_GROUP_SIZE_Y 16
+#define THREAD_GROUP_SIZE_Z 1
+
+struct ColorRangeSetting
+{
+    /// <summary>
+    /// 阈值下限(含)
+    /// 当使用OnlyTile或TileBasedMesh时单位为【屏幕顶点数/1万屏幕像素】
+    /// 当使用OnlyMesh时单位为【Mesh顶点数/Mesh占用像素】
+    /// </summary>
+    float threshold;
+    float4 color;
+};
+
+
+cbuffer CB
+{
+    float4 _TileParams2; // 分块数据（1.0 / width, 1.0 / height, 1.0 / tileNumX, 1.0 / tileNumY）
+    float4 _ScreenParams; // 屏幕分辨率数据 （width, height, 1.0 / width, 1.0 / height）
+    int _TileNumX;
+    int _ColorRangeSettingCount;
+}
+// input
+StructuredBuffer<ColorRangeSetting> _ColorRangeSetting; 
+StructuredBuffer<uint> _TileVerticesCount; // 长度为 tileNumX * tileNumY
+
+RWTexture2D<float4> _TileProfilerRT;
+
+float4 GetProfilerColor(int vertexCount)
+{
+    float4 targetColor = 1;
+    for(int k = 0; k < _ColorRangeSettingCount; k++)
+    {
+        ColorRangeSetting setting = _ColorRangeSetting[k];
+        if(setting.threshold <= vertexCount)
+        {
+            targetColor = setting.color;
+        }
+        else
+        {
+            break;
+        }
+    }
+    return targetColor;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_X, 1)]
+void GenerateProfilerRTForOnlyTile (uint3 id : SV_DispatchThreadID)
+{
+    int2 texelPos = id.xy;
+
+    int tileX = (float)texelPos.x * _TileParams2.x;
+    int tileY = (float)texelPos.y * _TileParams2.y;
+
+    int tileIndex = tileX + tileY * _TileNumX;
+    int vertexCount = _TileVerticesCount[tileIndex];
+    _TileProfilerRT[texelPos] = GetProfilerColor(vertexCount);
+}
+
+// 将half4变回int
+int DecodeHalf4ToInt(half4 encodedValue)
+{
+    // 将half4中的值重新组合成int
+    int r = round(encodedValue.r * 255.0);
+    int g = round(encodedValue.g * 255.0);
+    int b = round(encodedValue.b * 255.0);
+    int a = round(encodedValue.a * 255.0);
+
+    // 组合成最终的int值
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+
+RWTexture2D<uint2> _TileProfilerRTUint2;
+int _HeatMapRange;
+int _HeatMapStep;
+int _HeatMapOffsetCount;
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_X, 1)]
+void GenerateProfilerRTForMeshHeatMap(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = id.xy;
+    if(pos.x < _ScreenParams.x && pos.y < _ScreenParams.y)
+    {
+        uint2 data = _TileProfilerRTUint2[pos];
+        uint pixelRendererId = data.r;
+        
+        uint vertexCount = 0;
+        int validPointOffsets = 0;
+        int range = _HeatMapRange;
+        int maxCount = min(_HeatMapOffsetCount, 145);
+        int2 posOffsets[145];
+        int posIndex = 0;
+        for(int i = -range; i <= range; i++)
+        {
+            int jRange = range - abs(i);
+            for(int j = -jRange; j <= jRange; j++)
+            {
+                posOffsets[posIndex] = int2(i, j) * int2(_HeatMapStep, _HeatMapStep);
+                posIndex ++;
+            }
+        }
+        for(int k = 0; k < maxCount; k++)
+        {
+            int2 newPos = pos.xy + posOffsets[k];
+            if(newPos.x >= 0 && newPos.y >= 0 && pos.x < _ScreenParams.x && pos.y < _ScreenParams.y)
+            {
+                uint2 data2 = (newPos.x == pos.x && newPos.y == pos.y) ? data : _TileProfilerRTUint2[newPos];
+                if(data2.r == pixelRendererId)
+                {
+                    vertexCount += data2.g;
+                    validPointOffsets ++;
+                }
+            }
+        }
+        float avgVertexCount = (float)vertexCount / (float)validPointOffsets;
+        _TileProfilerRT[pos] = half4(avgVertexCount, 0, 0, 1);
+    }
+}
+
+RWTexture2D<float> _OutputOverdrawRT;
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_X, 1)]
+void GenerateProfilerRTForOverdraw(uint3 id : SV_DispatchThreadID)
+{
+    _TileProfilerRT[id.xy] = GetProfilerColor((int)(_OutputOverdrawRT[id.xy]));
+}

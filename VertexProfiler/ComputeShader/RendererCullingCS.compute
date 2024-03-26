@@ -1,0 +1,74 @@
+
+// 基于摄像机视锥体的剔除
+// Unity默认的剔除规则只有视锥体剔除，没有遮挡剔除，这个判断就只做一个视锥体判断就好
+#pragma kernel CameraFrustumCulling
+
+#include "VertexProfilerInput.hlsl"
+
+#define THREAD_GROUP_SIZE_X 64
+#define THREAD_GROUP_SIZE_Y 1
+#define THREAD_GROUP_SIZE_Z 1
+
+cbuffer CB
+{
+    uint _RendererTotalNum;
+    float3 _CameraWorldPosition;
+    float4x4 _UNITY_MATRIX_VP;
+}
+
+RWStructuredBuffer<RendererBoundsData> _RendererBoundsDataBuffer;
+RWStructuredBuffer<uint> _VisibleFlagBuffer;
+
+inline uint IsCameraOutsideObjBounds(float3 pos, float3 minPos, float3 maxPos)
+{
+    float boundsSize = distance(maxPos, minPos);
+    return ((distance(pos, maxPos) > boundsSize)
+            + (distance(pos, minPos) > boundsSize));
+}
+
+inline uint IsVisibleAfterFrustumCulling(float4 clipPos)
+{
+    return (clipPos.z > clipPos.w 
+            || clipPos.x < -clipPos.w 
+            || clipPos.x > clipPos.w 
+            || clipPos.y < -clipPos.w 
+            || clipPos.y > clipPos.w) 
+            ? 0 : 1;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void CameraFrustumCulling(uint3 id : SV_DispatchThreadID)
+{
+    // 记录可以进行渲染的rendererId，其中groupIndex就是rendererId
+    uint rendererId = id.x;
+    if(rendererId < _RendererTotalNum)
+    {
+        RendererBoundsData data = _RendererBoundsDataBuffer[rendererId];
+
+        // 包围盒8个角，有一个在视锥体内就要判定为会被渲染
+        float3 minPos = data.center - data.extends;
+        float3 maxPos = data.center + data.extends;
+        float4 boxCorners[8];
+        boxCorners[0] = float4(minPos.x, minPos.y, minPos.z, 1.0);
+        boxCorners[1] = float4(minPos.x, minPos.y, maxPos.z, 1.0);
+        boxCorners[2] = float4(minPos.x, maxPos.y, minPos.z, 1.0);
+        boxCorners[3] = float4(minPos.x, maxPos.y, maxPos.z, 1.0);
+        boxCorners[4] = float4(maxPos.x, minPos.y, minPos.z, 1.0);
+        boxCorners[5] = float4(maxPos.x, minPos.y, maxPos.z, 1.0);
+        boxCorners[6] = float4(maxPos.x, maxPos.y, minPos.z, 1.0);
+        boxCorners[7] = float4(maxPos.x, maxPos.y, maxPos.z, 1.0);
+
+        // 检查视锥体是否可以看到包围盒，以及摄像机是否在这个包围盒之外
+        float4 posCS;
+        uint inFrustum = 0;
+        [unroll]
+        for(int i = 0; i < 8; i++)
+        {
+            posCS = mul(_UNITY_MATRIX_VP, boxCorners[i]);
+            inFrustum = saturate(inFrustum + IsVisibleAfterFrustumCulling(posCS)); 
+        }
+        uint isVisible = IsCameraOutsideObjBounds(_CameraWorldPosition, minPos, maxPos) * inFrustum;
+
+        _VisibleFlagBuffer[rendererId] = isVisible;
+    }
+}
