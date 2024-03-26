@@ -1,0 +1,2 @@
+# VertexProfilerTool
+一个Unity中可用的顶点密度debug工具，部分调试类型可导出密度信息
